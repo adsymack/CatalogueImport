@@ -121,8 +121,7 @@ def auto_map_headers(cols: List[str]) -> Tuple[Dict[str, str], List[str]]:
     return mapping, missing_targets
 
 def clean_currency_str(s: str) -> str:
-    s = (s or "").replace(",", "").replace("$", "").strip()
-    return s
+    return (s or "").replace(",", "").replace("$", "").strip()
 
 def to_numeric_or_none(s: str):
     s2 = clean_currency_str(s)
@@ -135,7 +134,7 @@ def to_numeric_or_none(s: str):
         return None
 
 def build_template_frame(df: pd.DataFrame) -> pd.DataFrame:
-    mapping, missing = auto_map_headers(list(df.columns))
+    mapping, _missing = auto_map_headers(list(df.columns))
 
     # Always create output with the SAME NUMBER OF ROWS as input
     out = pd.DataFrame(index=range(len(df)))
@@ -182,7 +181,6 @@ def validate_frame(out: pd.DataFrame) -> List[Dict]:
     return errors
 
 def errors_to_csv_bytes(errs: List[Dict]) -> io.BytesIO:
-    import csv
     sio = io.StringIO()
     w = csv.DictWriter(sio, fieldnames=["row","field","error"])
     w.writeheader()
@@ -218,20 +216,21 @@ def process():
                 csv_err,
                 mimetype="text/csv",
                 as_attachment=True,
-                download_name=f\"{base}_errors.csv\",
+                download_name=f"{base}_errors.csv",
             )
 
         csv_buf = io.StringIO()
         out.to_csv(csv_buf, index=False)
-        csv_bytes = io.BytesIO(csv_buf.getvalue().encode(\"utf-8-sig\"))
+        csv_bytes = io.BytesIO(csv_buf.getvalue().encode("utf-8-sig"))
         return send_file(
             csv_bytes,
-            mimetype=\"text/csv\",
+            mimetype="text/csv",
             as_attachment=True,
-            download_name=f\"{base}_simpro_template.csv\",
+            download_name=f"{base}_simpro_template.csv",
         )
     except Exception as e:
-        return jsonify({\"ok\": False, \"error\": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-if __name__ == \"__main__\":
-    app.run(host=\"0.0.0.0\", port=int(os.environ.get(\"PORT\", \"8000\")), debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
+
