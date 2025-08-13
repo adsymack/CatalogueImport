@@ -2,6 +2,7 @@ import io
 import os
 import csv
 import json
+import re
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -39,52 +40,89 @@ TEMPLATE_COLUMNS: List[str] = _cfg.get("template_columns", [
 ])
 ALIASES: Dict[str, str] = _cfg.get("aliases", {})
 DEFAULTS: Dict[str, str] = _cfg.get("defaults", {"Tax Code": "G", "UOM": "ea"})
-ALLOWED_TAX: List[str] = _cfg.get("allowed_tax_codes", ["G","F","E"])  # Enforce set
-
+ALLOWED_TAX: List[str] = _cfg.get("allowed_tax_codes", ["G","F","E"])
 REQUIRED_NONEMPTY: List[str] = _cfg.get("required_nonempty", ["Part Number"])
 REQUIRED_NUMERIC: List[str] = _cfg.get("required_numeric", ["Cost ex Tax","Sell ex Tax"])
 
 # -------- Helpers --------
-def normalize(s: str) -> str:
-    return (s or "").strip().lower().replace("-", " ").replace("_", " ")
+_BOM = "\ufeff"
+
+def norm_header(s: str) -> str:
+    s = (s or "").replace(_BOM, "")
+    s = s.strip().lower()
+    s = s.replace("-", " ").replace("_", " ")
+    s = re.sub(r"[^\w\s]", " ", s)   # remove punctuation
+    s = re.sub(r"\s+", " ", s)       # collapse spaces
+    return s
 
 def read_dataframe_from_upload(file_storage) -> pd.DataFrame:
-    filename = file_storage.filename or ""
+    filename = (file_storage.filename or "").strip()
     data = file_storage.read()
     if not data:
         raise ValueError("Uploaded file is empty.")
     if filename.lower().endswith((".xlsx", ".xls")):
         df = pd.read_excel(io.BytesIO(data), dtype=str)
     else:
-        try:
-            df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False)
-        except UnicodeDecodeError:
-            df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False, encoding="latin-1")
-    for col in df.columns:
-        df[col] = df[col].astype(str).map(lambda x: x.strip())
+        # CSVs can have BOM or odd encodings; try a few
+        for enc in (None, "utf-8-sig", "latin-1"):
+            try:
+                df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False, encoding=enc)
+                break
+            except Exception:
+                continue
+        else:
+            # final fallback
+            df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False, errors="ignore")
+    # Ensure strings + strip
+    df = df.applymap(lambda x: str(x).strip())
+    # Strip BOM from column names too
+    df.columns = [c.replace(_BOM, "").strip() for c in df.columns]
     return df
 
 def auto_map_headers(cols: List[str]) -> Tuple[Dict[str, str], List[str]]:
     mapping: Dict[str, str] = {}
     used_targets = set()
+
+    # Precompute normalized lookups
+    template_norm = {norm_header(t): t for t in TEMPLATE_COLUMNS}
+    alias_norm = {norm_header(k): v for k, v in ALIASES.items()}
+
+    # 1) exact by normalized equality to template
     for c in cols:
-        for t in TEMPLATE_COLUMNS:
-            if normalize(c) == normalize(t):
-                mapping[c] = t
-                used_targets.add(t)
-                break
+        nc = norm_header(c)
+        t = template_norm.get(nc)
+        if t and t not in used_targets:
+            mapping[c] = t
+            used_targets.add(t)
+
+    # 2) alias matches
     for c in cols:
         if c in mapping:
             continue
-        tgt = ALIASES.get(normalize(c))
-        if tgt and tgt not in used_targets:
-            mapping[c] = tgt
-            used_targets.add(tgt)
+        nc = norm_header(c)
+        t = alias_norm.get(nc)
+        if t and t not in used_targets:
+            mapping[c] = t
+            used_targets.add(t)
+
+    # 3) fuzzy partial contains (e.g., 'supplier code' -> 'Supplier Part Number')
+    for c in cols:
+        if c in mapping:
+            continue
+        nc = norm_header(c)
+        for tn_norm, t_actual in template_norm.items():
+            if tn_norm in nc or nc in tn_norm:
+                if t_actual not in used_targets:
+                    mapping[c] = t_actual
+                    used_targets.add(t_actual)
+                    break
+
     missing_targets = [t for t in TEMPLATE_COLUMNS if t not in used_targets]
     return mapping, missing_targets
 
 def clean_currency_str(s: str) -> str:
-    return (s or "").replace(",", "").strip()
+    s = (s or "").replace(",", "").replace("$", "").strip()
+    return s
 
 def to_numeric_or_none(s: str):
     s2 = clean_currency_str(s)
@@ -98,44 +136,48 @@ def to_numeric_or_none(s: str):
 
 def build_template_frame(df: pd.DataFrame) -> pd.DataFrame:
     mapping, missing = auto_map_headers(list(df.columns))
-    out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
+
+    # Always create output with the SAME NUMBER OF ROWS as input
+    out = pd.DataFrame(index=range(len(df)))
+    # put all template columns in place (empty initially)
+    for col in TEMPLATE_COLUMNS:
+        out[col] = ""
+
+    # Copy mapped columns across
     for src, tgt in mapping.items():
-        out[tgt] = df[src]
+        out[tgt] = df[src].values
+
+    # Apply defaults (only where empty)
     for col, val in DEFAULTS.items():
         if col in out.columns:
-            out[col] = out.get(col, pd.Series([""] * len(df)))
-            out[col] = out[col].mask(out[col].eq(""), val).fillna(val)
-    for col in TEMPLATE_COLUMNS:
-        if col not in out.columns:
-            out[col] = DEFAULTS.get(col, "")
-    # scrub currency-like strings
-    for col in ["Cost ex Tax","Sell ex Tax"]:
+            out[col] = out[col].where(out[col].astype(str).str.strip() != "", val)
+
+    # Clean numeric-looking fields
+    for col in ["Cost ex Tax", "Sell ex Tax"]:
         if col in out.columns:
             out[col] = out[col].astype(str).map(clean_currency_str)
-    # reorder
+
+    # Final column order
     out = out[TEMPLATE_COLUMNS]
+
     return out
 
 def validate_frame(out: pd.DataFrame) -> List[Dict]:
     errors: List[Dict] = []
     n = len(out)
     for i in range(n):
-        rownum = i + 2  # 1-based with header (CSV-style)
-        # Required non-empty
+        rownum = i + 2  # 1-based with header row
         for col in REQUIRED_NONEMPTY:
-            if col in out.columns:
-                if str(out.at[i, col]).strip() == "":
-                    errors.append({"row": rownum, "field": col, "error": "Required"})
-        # Required numeric
+            if col in out.columns and str(out.at[i, col]).strip() == "":
+                errors.append({"row": rownum, "field": col, "error": "Required"})
         for col in REQUIRED_NUMERIC:
             if col in out.columns:
                 val = to_numeric_or_none(str(out.at[i, col]))
-                if val is None:
+                if val is None and str(out.at[i, col]).strip() != "":
                     errors.append({"row": rownum, "field": col, "error": "Must be numeric ex tax"})
-        # Tax Code
         if "Tax Code" in out.columns:
-            tc = str(out.at[i, "Tax Code"]).strip().upper()
-            if tc not in ALLOWED_TAX:
+            tc = str(out.at[i, "Tax Code"]).strip().upper() or DEFAULTS.get("Tax Code","")
+            if tc and tc not in ALLOWED_TAX:
                 errors.append({"row": rownum, "field": "Tax Code", "error": f"Must be one of {ALLOWED_TAX}"})
     return errors
 
@@ -154,12 +196,9 @@ def health():
     return jsonify({
         "ok": True,
         "service": "simPRO Imports Backend",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "time": datetime.utcnow().isoformat() + "Z",
-        "template_columns": TEMPLATE_COLUMNS,
-        "allowed_tax": ALLOWED_TAX,
-        "required_nonempty": REQUIRED_NONEMPTY,
-        "required_numeric": REQUIRED_NUMERIC
+        "template_columns": TEMPLATE_COLUMNS
     })
 
 @app.route("/process", methods=["POST"])
@@ -179,20 +218,20 @@ def process():
                 csv_err,
                 mimetype="text/csv",
                 as_attachment=True,
-                download_name=f"{base}_errors.csv",
+                download_name=f\"{base}_errors.csv\",
             )
 
         csv_buf = io.StringIO()
         out.to_csv(csv_buf, index=False)
-        csv_bytes = io.BytesIO(csv_buf.getvalue().encode("utf-8-sig"))
+        csv_bytes = io.BytesIO(csv_buf.getvalue().encode(\"utf-8-sig\"))
         return send_file(
             csv_bytes,
-            mimetype="text/csv",
+            mimetype=\"text/csv\",
             as_attachment=True,
-            download_name=f"{base}_simpro_template.csv",
+            download_name=f\"{base}_simpro_template.csv\",
         )
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({\"ok\": False, \"error\": str(e)}), 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
+if __name__ == \"__main__\":
+    app.run(host=\"0.0.0.0\", port=int(os.environ.get(\"PORT\", \"8000\")), debug=True)
