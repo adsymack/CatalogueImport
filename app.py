@@ -44,6 +44,11 @@ ALLOWED_TAX: List[str] = _cfg.get("allowed_tax_codes", ["G","F","E"])
 REQUIRED_NONEMPTY: List[str] = _cfg.get("required_nonempty", ["Part Number"])
 REQUIRED_NUMERIC: List[str] = _cfg.get("required_numeric", ["Cost ex Tax","Sell ex Tax"])
 
+# Autofill priorities for Part Number if missing
+PART_NUMBER_FALLBACKS: List[str] = _cfg.get("part_number_fallbacks", [
+    "Part Number","Supplier Part Number","Barcode","SKU","Code"
+])
+
 # -------- Helpers --------
 _BOM = "\ufeff"
 
@@ -60,8 +65,11 @@ def read_dataframe_from_upload(file_storage) -> pd.DataFrame:
     data = file_storage.read()
     if not data:
         raise ValueError("Uploaded file is empty.")
-    if filename.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(io.BytesIO(data), dtype=str)
+    if filename.lower().endswith(".xls"):
+        # For legacy .xls, use xlrd engine
+        df = pd.read_excel(io.BytesIO(data), dtype=str, engine="xlrd")
+    elif filename.lower().endswith((".xlsx", ".xlsm")):
+        df = pd.read_excel(io.BytesIO(data), dtype=str)  # openpyxl default
     else:
         # CSVs can have BOM or odd encodings; try a few
         for enc in (None, "utf-8-sig", "latin-1"):
@@ -71,7 +79,6 @@ def read_dataframe_from_upload(file_storage) -> pd.DataFrame:
             except Exception:
                 continue
         else:
-            # final fallback
             df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False, errors="ignore")
     # Ensure strings + strip
     df = df.applymap(lambda x: str(x).strip())
@@ -105,7 +112,7 @@ def auto_map_headers(cols: List[str]) -> Tuple[Dict[str, str], List[str]]:
             mapping[c] = t
             used_targets.add(t)
 
-    # 3) fuzzy partial contains (e.g., 'supplier code' -> 'Supplier Part Number')
+    # 3) fuzzy partial contains
     for c in cols:
         if c in mapping:
             continue
@@ -133,18 +140,32 @@ def to_numeric_or_none(s: str):
     except Exception:
         return None
 
+def first_nonempty(*vals: str) -> str:
+    for v in vals:
+        if str(v).strip():
+            return str(v).strip()
+    return ""
+
 def build_template_frame(df: pd.DataFrame) -> pd.DataFrame:
     mapping, _missing = auto_map_headers(list(df.columns))
 
     # Always create output with the SAME NUMBER OF ROWS as input
     out = pd.DataFrame(index=range(len(df)))
-    # put all template columns in place (empty initially)
     for col in TEMPLATE_COLUMNS:
         out[col] = ""
 
     # Copy mapped columns across
     for src, tgt in mapping.items():
         out[tgt] = df[src].values
+
+    # Autofill Part Number if blank using fallbacks (in order)
+    if "Part Number" in out.columns:
+        candidates = [c for c in PART_NUMBER_FALLBACKS if c in out.columns]
+        if candidates:
+            for i in range(len(out)):
+                if str(out.at[i, "Part Number"]).strip() == "":
+                    # take first non-empty from candidates for this row
+                    out.at[i, "Part Number"] = first_nonempty(*[out.at[i, c] for c in candidates if c in out.columns])
 
     # Apply defaults (only where empty)
     for col, val in DEFAULTS.items():
@@ -194,9 +215,10 @@ def health():
     return jsonify({
         "ok": True,
         "service": "simPRO Imports Backend",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "time": datetime.utcnow().isoformat() + "Z",
-        "template_columns": TEMPLATE_COLUMNS
+        "template_columns": TEMPLATE_COLUMNS,
+        "fallbacks": PART_NUMBER_FALLBACKS
     })
 
 @app.route("/process", methods=["POST"])
@@ -233,4 +255,3 @@ def process():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=True)
-

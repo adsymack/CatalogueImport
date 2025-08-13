@@ -70,7 +70,18 @@
     "maximum": "Maximum Stock",
     "maximum stock": "Maximum Stock",
     "notes": "Notes",
-    "note": "Notes"
+    "note": "Notes",
+    "item": "Part Number",
+    "item #": "Part Number",
+    "item#": "Part Number",
+    "part #": "Part Number",
+    "part#": "Part Number",
+    "catalogue code": "Part Number",
+    "catalog code": "Part Number",
+    "cat no": "Part Number",
+    "cat#": "Part Number",
+    "model": "Part Number",
+    "mpn": "Part Number"
   },
   "allowed_tax_codes": [
     "G",
@@ -83,5 +94,12 @@
   "required_numeric": [
     "Cost ex Tax",
     "Sell ex Tax"
+  ],
+  "part_number_fallbacks": [
+    "Part Number",
+    "Supplier Part Number",
+    "Barcode",
+    "SKU",
+    "Code"
   ]
 }
